@@ -1,5 +1,5 @@
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -44,9 +44,8 @@ def build_chart(measurements: list[dict], period: str) -> io.BytesIO:
     ax1.tick_params(axis="y", labelcolor="#333333")
     ax1.set_ylim(40, 220)
 
-    # Normal range band
-    ax1.axhspan(60, 80, alpha=0.07, color="#3498db", label="Норма диастол.")
-    ax1.axhspan(90, 120, alpha=0.07, color="#e74c3c", label="Норма систол.")
+    ax1.axhspan(60, 80, alpha=0.07, color="#3498db")
+    ax1.axhspan(90, 120, alpha=0.07, color="#e74c3c")
 
     if pulse_vals:
         ax2 = ax1.twinx()
@@ -61,7 +60,7 @@ def build_chart(measurements: list[dict], period: str) -> io.BytesIO:
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
     fig.autofmt_xdate()
 
-    ax1.set_title(f"Давление за {PERIOD_LABELS.get(period, period)}", fontsize=14, pad=12)
+    ax1.set_title(f"Давление за {PERIOD_LABELS.get(period, period)} (МСК)", fontsize=14, pad=12)
     ax1.legend(loc="upper left")
     ax1.grid(True, linestyle="--", alpha=0.4)
 

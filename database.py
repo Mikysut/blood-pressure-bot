@@ -1,7 +1,16 @@
 import aiosqlite
 import os
 from datetime import datetime
-from config import DB_PATH
+import pytz
+
+from config import DB_PATH, TIMEZONE
+
+MSK = pytz.timezone(TIMEZONE)
+
+
+def now_msk() -> datetime:
+    """Текущее время по МСК (naive datetime для хранения в БД)."""
+    return datetime.now(tz=MSK).replace(tzinfo=None)
 
 
 async def init_db():
@@ -13,7 +22,7 @@ async def init_db():
                 username        TEXT,
                 remind_morning  TEXT DEFAULT '09:00',
                 remind_evening  TEXT DEFAULT '21:00',
-                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at      TEXT
             )
         """)
         await db.execute("""
@@ -24,7 +33,7 @@ async def init_db():
                 diastolic   INTEGER NOT NULL,
                 pulse       INTEGER,
                 note        TEXT,
-                measured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                measured_at TEXT NOT NULL
             )
         """)
         await db.commit()
@@ -33,30 +42,60 @@ async def init_db():
 async def register_user(user_id: int, username: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
-            (user_id, username),
+            "INSERT OR IGNORE INTO users (user_id, username, created_at) VALUES (?, ?, ?)",
+            (user_id, username, now_msk().isoformat()),
         )
         await db.commit()
 
 
-async def add_measurement(user_id: int, systolic: int, diastolic: int, pulse: int | None = None, note: str | None = None):
+async def add_measurement(
+    user_id: int,
+    systolic: int,
+    diastolic: int,
+    pulse: int | None = None,
+    note: str | None = None,
+    measured_at: datetime | None = None,
+):
+    ts = (measured_at or now_msk()).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO measurements (user_id, systolic, diastolic, pulse, note) VALUES (?, ?, ?, ?, ?)",
-            (user_id, systolic, diastolic, pulse, note),
+            "INSERT INTO measurements (user_id, systolic, diastolic, pulse, note, measured_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, systolic, diastolic, pulse, note, ts),
         )
         await db.commit()
 
 
-async def get_history(user_id: int, limit: int = 10) -> list[dict]:
+async def add_measurements_bulk(user_id: int, rows: list[dict]):
+    """Массовая вставка записей. Каждый dict: systolic, diastolic, pulse, note, measured_at."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT INTO measurements (user_id, systolic, diastolic, pulse, note, measured_at) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (user_id, r["systolic"], r["diastolic"], r.get("pulse"), r.get("note"), r["measured_at"].isoformat())
+                for r in rows
+            ],
+        )
+        await db.commit()
+
+
+async def get_history(user_id: int, limit: int = 10, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM measurements WHERE user_id = ? ORDER BY measured_at DESC LIMIT ?",
-            (user_id, limit),
+            "SELECT * FROM measurements WHERE user_id = ? ORDER BY measured_at DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
         ) as cursor:
             rows = await cursor.fetchall()
     return [dict(r) for r in rows]
+
+
+async def get_total_count(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM measurements WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row else 0
 
 
 async def get_measurements_since(user_id: int, since: datetime) -> list[dict]:
