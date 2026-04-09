@@ -89,6 +89,21 @@ async def get_history(user_id: int, limit: int = 10, offset: int = 0) -> list[di
     return [dict(r) for r in rows]
 
 
+async def delete_measurement(measurement_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM measurements WHERE id = ? AND user_id = ?",
+            (measurement_id, user_id),
+        )
+        await db.commit()
+
+
+async def clear_all_measurements(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM measurements WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
 async def get_total_count(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(

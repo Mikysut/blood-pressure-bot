@@ -30,9 +30,10 @@ from charts import build_chart, PERIODS
 logger = logging.getLogger(__name__)
 
 # ── ConversationHandler состояния ────────────────────────────────────────────
-MEASURE_BP, MEASURE_PULSE, MEASURE_NOTE, MEASURE_CONFIRM = range(4)
+MEASURE_BP, MEASURE_PULSE, MEASURE_NOTE, MEASURE_TIME, MEASURE_TIME_INPUT, MEASURE_CONFIRM = range(6)
 REMIND_MORNING, REMIND_EVENING, REMIND_CONFIRM = range(10, 13)
 EXCEL_WAIT_FILE, EXCEL_CONFIRM = range(20, 22)
+CLEAR_CONFIRM = 30
 
 # Кнопки главного меню
 BTN_ADD      = "📝 Записать замер"
@@ -44,6 +45,7 @@ BTN_HELP     = "❓ Помощь"
 
 BP_RE = re.compile(r"(\d{2,3})\s*/\s*(\d{2,3})")
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+DATETIME_RE = re.compile(r"^(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2})$")
 
 HISTORY_PAGE = 10
 
@@ -88,7 +90,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Привет, {user.first_name}!\n\n"
         "Я помогу отслеживать давление и пульс.\n"
-        "Напоминания настроены на <b>09:00</b> и <b>21:00</b> по МСК.\n\n"
+        "Напоминания настроены на <b>09:00</b> и <b>21:00</b>.\n\n"
         "Используй кнопки меню ниже 👇",
         parse_mode="HTML",
         reply_markup=main_menu(),
@@ -105,7 +107,7 @@ async def btn_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📈 <b>График</b> — изменение давления за период\n"
         "⏰ <b>Напоминания</b> — настроить время напоминаний\n"
         "📥 <b>Импорт Excel</b> — загрузить старые данные из файла\n\n"
-        "Все времена отображаются по Москве (МСК, UTC+3).",
+        "Используй кнопки меню для навигации.",
         parse_mode="HTML",
         reply_markup=main_menu(),
     )
@@ -117,42 +119,58 @@ async def btn_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_history(update, context, offset=0)
 
 
+def _record_text(r: dict) -> str:
+    dt        = datetime.fromisoformat(r["measured_at"]).strftime("%d.%m.%Y %H:%M")
+    pulse_str = f"\nПульс: <b>{r['pulse']}</b> уд/мин" if r["pulse"] else ""
+    note_str  = f"\n📝 {r['note']}" if r["note"] else ""
+    return f"🕐 <b>{dt}</b>\n{r['systolic']}/{r['diastolic']} мм рт.ст.{pulse_str}{note_str}"
+
+
 async def _show_history(update: Update, context: ContextTypes.DEFAULT_TYPE, offset: int):
     user_id = update.effective_user.id
     await database.register_user(user_id, update.effective_user.username or "")
 
     records = await database.get_history(user_id, limit=HISTORY_PAGE, offset=offset)
-    total = await database.get_total_count(user_id)
+    total   = await database.get_total_count(user_id)
+
+    msg = update.effective_message
 
     if not records and offset == 0:
-        await update.effective_message.reply_text(
+        await msg.reply_text(
             "Записей пока нет.\nНажми 📝 Записать замер чтобы добавить первый замер.",
             reply_markup=main_menu(),
         )
         return
 
-    lines = [f"<b>Записи {offset + 1}–{offset + len(records)} из {total}:</b>\n"]
-    for r in records:
-        dt = datetime.fromisoformat(r["measured_at"]).strftime("%d.%m.%Y %H:%M")
-        pulse_str = f"  пульс: <b>{r['pulse']}</b>" if r["pulse"] else ""
-        note_str  = f"\n  📝 {r['note']}" if r["note"] else ""
-        lines.append(f"🕐 <b>{dt}</b>\n  {r['systolic']}/{r['diastolic']} мм рт.ст.{pulse_str}{note_str}")
-
-    text = "\n\n".join(lines)
-
+    # Заголовок с навигацией и кнопкой очистки
     nav_buttons = []
     if offset > 0:
         nav_buttons.append(InlineKeyboardButton("◀ Назад", callback_data=f"history_{offset - HISTORY_PAGE}"))
     if offset + HISTORY_PAGE < total:
         nav_buttons.append(InlineKeyboardButton("Ещё ▶", callback_data=f"history_{offset + HISTORY_PAGE}"))
 
-    kb = InlineKeyboardMarkup([nav_buttons]) if nav_buttons else None
+    header_rows = []
+    if nav_buttons:
+        header_rows.append(nav_buttons)
+    header_rows.append([InlineKeyboardButton("⚠️ Очистить всю историю", callback_data="clear_all")])
 
-    msg = update.effective_message
-    if update.callback_query:
-        await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
-    else:
-        await msg.reply_text(text, parse_mode="HTML", reply_markup=kb)
+    await msg.reply_text(
+        f"<b>Записи {offset + 1}–{offset + len(records)} из {total}</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(header_rows),
+    )
+
+    # Каждая запись — отдельное сообщение с кнопкой удаления
+    for r in records:
+        # Кешируем данные записи для восстановления при отмене удаления
+        context.bot_data[f"rec_{r['id']}"] = r
+        await msg.reply_text(
+            _record_text(r),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"del_{r['id']}")
+            ]]),
+        )
 
 
 async def history_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -160,6 +178,75 @@ async def history_page_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     offset = int(query.data.split("_")[1])
     await _show_history(update, context, offset=offset)
+
+
+async def delete_record_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    record_id = int(query.data.split("_")[1])
+    r = context.bot_data.get(f"rec_{record_id}")
+    dt = datetime.fromisoformat(r["measured_at"]).strftime("%d.%m.%Y %H:%M") if r else "—"
+    bp = f"{r['systolic']}/{r['diastolic']}" if r else "—"
+    await query.message.edit_text(
+        f"⚠️ Удалить эту запись?\n\n📅 <b>{dt}</b> — {bp} мм рт.ст.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"delconfirm_{record_id}"),
+            InlineKeyboardButton("❌ Отмена",      callback_data=f"delcancel_{record_id}"),
+        ]]),
+    )
+
+
+async def delete_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    record_id = int(query.data.split("_")[1])
+    await database.delete_measurement(record_id, update.effective_user.id)
+    context.bot_data.pop(f"rec_{record_id}", None)
+    await query.message.edit_text("✅ Запись удалена.", reply_markup=None)
+
+
+async def delete_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    record_id = int(query.data.split("_")[1])
+    r = context.bot_data.get(f"rec_{record_id}")
+    if r:
+        await query.message.edit_text(
+            _record_text(r),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"del_{record_id}")
+            ]]),
+        )
+    else:
+        await query.message.edit_text("Запись не найдена.", reply_markup=None)
+
+
+async def clear_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "Удалить <b>все</b> записи истории? Это действие нельзя отменить.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ Да, удалить всё", callback_data="clear_all_confirm"),
+            InlineKeyboardButton("❌ Отмена", callback_data="clear_all_cancel"),
+        ]]),
+    )
+
+
+async def clear_all_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await database.clear_all_measurements(update.effective_user.id)
+    await query.message.edit_text("✅ История очищена.", reply_markup=None)
+
+
+async def clear_all_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.delete()
 
 
 # ── График ────────────────────────────────────────────────────────────────────
@@ -191,7 +278,7 @@ async def chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     buf = build_chart(records, period)
-    await query.message.reply_photo(photo=buf, caption="График давления (МСК)")
+    await query.message.reply_photo(photo=buf, caption="График давления")
 
 
 # ── ConversationHandler: запись замера ────────────────────────────────────────
@@ -266,11 +353,59 @@ async def measure_note_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data["note"] = None
-    return await _show_measure_confirm(query.message, context)
+    return await _ask_measure_time(query.message, context)
 
 
 async def measure_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["note"] = update.message.text.strip()
+    return await _ask_measure_time(update.message, context)
+
+
+async def _ask_measure_time(message, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(tz=MSK).replace(tzinfo=None)
+    now_str = now.strftime("%d.%m.%Y %H:%M")
+    await message.reply_text(
+        f"Когда сделан замер?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🕐 Сейчас ({now_str})", callback_data="measure_time_now"),
+            InlineKeyboardButton("✏️ Ввести вручную",       callback_data="measure_time_manual"),
+        ]]),
+    )
+    return MEASURE_TIME
+
+
+async def measure_time_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data["measured_at"] = None  # будет использовано now_msk() при сохранении
+    return await _show_measure_confirm(query.message, context)
+
+
+async def measure_time_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "Введи дату и время замера:\n\nФормат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\nПример: <code>08.04.2026 09:30</code>",
+        parse_mode="HTML",
+    )
+    return MEASURE_TIME_INPUT
+
+
+async def measure_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    match = DATETIME_RE.match(text)
+    if not match:
+        await update.message.reply_text(
+            "Неверный формат. Введи дату и время:\n<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>",
+            parse_mode="HTML",
+        )
+        return MEASURE_TIME_INPUT
+    try:
+        dt = datetime.strptime(text, "%d.%m.%Y %H:%M")
+    except ValueError:
+        await update.message.reply_text("Неверная дата. Попробуй ещё раз:")
+        return MEASURE_TIME_INPUT
+    context.user_data["measured_at"] = dt
     return await _show_measure_confirm(update.message, context)
 
 
@@ -278,9 +413,13 @@ async def _show_measure_confirm(message, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     pulse_str = f"\nПульс: <b>{d['pulse']}</b> уд/мин" if d.get("pulse") else ""
     note_str  = f"\nЗаметка: {d['note']}" if d.get("note") else ""
+    if d.get("measured_at"):
+        time_str = f"\nВремя: <b>{d['measured_at'].strftime('%d.%m.%Y %H:%M')}</b>"
+    else:
+        time_str = f"\nВремя: <b>сейчас</b>"
     await message.reply_text(
         f"Проверь данные:\n\n"
-        f"Давление: <b>{d['sys']}/{d['dia']}</b> мм рт.ст.{pulse_str}{note_str}\n\n"
+        f"Давление: <b>{d['sys']}/{d['dia']}</b> мм рт.ст.{pulse_str}{note_str}{time_str}\n\n"
         "Сохранить?",
         parse_mode="HTML",
         reply_markup=confirm_kb("measure_save"),
@@ -294,7 +433,7 @@ async def measure_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     user_id = update.effective_user.id
 
-    await database.add_measurement(user_id, d["sys"], d["dia"], d.get("pulse"), d.get("note"))
+    await database.add_measurement(user_id, d["sys"], d["dia"], d.get("pulse"), d.get("note"), d.get("measured_at"))
 
     eval_str = _evaluate_bp(d["sys"], d["dia"])
     await query.message.reply_text(
@@ -341,7 +480,7 @@ async def btn_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Текущие напоминания:\n"
         f"Утро: <b>{morning}</b>  |  Вечер: <b>{evening}</b>\n\n"
-        "Выбери или введи новое <b>утреннее</b> время (МСК):",
+        "Выбери или введи новое <b>утреннее</b> время:",
         parse_mode="HTML",
         reply_markup=time_quick_kb(["07:00", "08:00", "09:00", "10:00"], "remind_m"),
     )
@@ -354,7 +493,7 @@ async def remind_morning_quick(update: Update, context: ContextTypes.DEFAULT_TYP
     time_str = query.data.replace("remind_m_", "")
     context.user_data["remind_morning"] = time_str
     await query.message.reply_text(
-        f"Утро: <b>{time_str}</b>\n\nВыбери или введи <b>вечернее</b> время (МСК):",
+        f"Утро: <b>{time_str}</b>\n\nВыбери или введи <b>вечернее</b> время:",
         parse_mode="HTML",
         reply_markup=time_quick_kb(["19:00", "20:00", "21:00", "22:00"], "remind_e"),
     )
@@ -371,7 +510,7 @@ async def remind_morning_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return REMIND_MORNING
     context.user_data["remind_morning"] = text
     await update.message.reply_text(
-        f"Утро: <b>{text}</b>\n\nВыбери или введи <b>вечернее</b> время (МСК):",
+        f"Утро: <b>{text}</b>\n\nВыбери или введи <b>вечернее</b> время:",
         parse_mode="HTML",
         reply_markup=time_quick_kb(["19:00", "20:00", "21:00", "22:00"], "remind_e"),
     )
@@ -418,7 +557,7 @@ async def remind_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await database.update_remind_times(user_id, m, e)
     sched.schedule_user(user_id, m, e)
     await query.message.reply_text(
-        f"✅ Напоминания сохранены:\nУтро: <b>{m}</b>  |  Вечер: <b>{e}</b> (МСК)",
+        f"✅ Напоминания сохранены:\nУтро: <b>{m}</b>  |  Вечер: <b>{e}</b>",
         parse_mode="HTML",
         reply_markup=main_menu(),
     )
@@ -650,6 +789,13 @@ def register_handlers(app):
                 CallbackQueryHandler(measure_note_skip, pattern="^skip$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, measure_note),
             ],
+            MEASURE_TIME: [
+                CallbackQueryHandler(measure_time_now,    pattern="^measure_time_now$"),
+                CallbackQueryHandler(measure_time_manual, pattern="^measure_time_manual$"),
+            ],
+            MEASURE_TIME_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, measure_time_input),
+            ],
             MEASURE_CONFIRM: [
                 CallbackQueryHandler(measure_save,   pattern="^measure_save$"),
                 CallbackQueryHandler(confirm_cancel, pattern="^confirm_cancel$"),
@@ -710,6 +856,12 @@ def register_handlers(app):
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_EXCEL)}$"),   btn_excel))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HELP)}$"),    btn_help))
 
-    app.add_handler(CallbackQueryHandler(chart_callback,         pattern=r"^chart_"))
-    app.add_handler(CallbackQueryHandler(history_page_callback,  pattern=r"^history_\d+$"))
-    app.add_handler(CallbackQueryHandler(excel_template,         pattern="^excel_template$"))
+    app.add_handler(CallbackQueryHandler(chart_callback,            pattern=r"^chart_"))
+    app.add_handler(CallbackQueryHandler(history_page_callback,    pattern=r"^history_\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_record_callback,   pattern=r"^del_\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_confirm_callback,  pattern=r"^delconfirm_\d+$"))
+    app.add_handler(CallbackQueryHandler(delete_cancel_callback,   pattern=r"^delcancel_\d+$"))
+    app.add_handler(CallbackQueryHandler(clear_all_callback,       pattern="^clear_all$"))
+    app.add_handler(CallbackQueryHandler(clear_all_confirm_callback, pattern="^clear_all_confirm$"))
+    app.add_handler(CallbackQueryHandler(clear_all_cancel_callback,  pattern="^clear_all_cancel$"))
+    app.add_handler(CallbackQueryHandler(excel_template,           pattern="^excel_template$"))

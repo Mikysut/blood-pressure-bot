@@ -60,7 +60,7 @@ def build_chart(measurements: list[dict], period: str) -> io.BytesIO:
     ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
     fig.autofmt_xdate()
 
-    ax1.set_title(f"Давление за {PERIOD_LABELS.get(period, period)} (МСК)", fontsize=14, pad=12)
+    ax1.set_title(f"Давление за {PERIOD_LABELS.get(period, period)}", fontsize=14, pad=12)
     ax1.legend(loc="upper left")
     ax1.grid(True, linestyle="--", alpha=0.4)
 
