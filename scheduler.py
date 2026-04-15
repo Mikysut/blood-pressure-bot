@@ -55,6 +55,9 @@ def schedule_user(user_id: int, morning: str, evening: str):
             id=job_id,
             args=[user_id],
             replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
         )
 
 
