@@ -36,6 +36,15 @@ async def init_db():
                 measured_at TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_measurements_user_date
+              ON measurements(user_id, measured_at DESC)
+        """)
+        await db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_measurements_user_time
+              ON measurements(user_id, measured_at)
+        """)
+        await db.execute("PRAGMA foreign_keys = ON")
         await db.commit()
 
 
@@ -69,7 +78,7 @@ async def add_measurements_bulk(user_id: int, rows: list[dict]):
     """Массовая вставка записей. Каждый dict: systolic, diastolic, pulse, note, measured_at."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executemany(
-            "INSERT INTO measurements (user_id, systolic, diastolic, pulse, note, measured_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO measurements (user_id, systolic, diastolic, pulse, note, measured_at) VALUES (?, ?, ?, ?, ?, ?)",
             [
                 (user_id, r["systolic"], r["diastolic"], r.get("pulse"), r.get("note"), r["measured_at"].isoformat())
                 for r in rows
@@ -145,5 +154,16 @@ async def get_user(user_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def get_measurement_by_id(measurement_id: int, user_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM measurements WHERE id = ? AND user_id = ?",
+            (measurement_id, user_id),
+        ) as cursor:
             row = await cursor.fetchone()
     return dict(row) if row else None
